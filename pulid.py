@@ -14,6 +14,7 @@ from comfy.ldm.modules.attention import optimized_attention
 from .eva_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 
 from .encoders import IDEncoder
+from .encoders_transformer import IDFormer
 
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
@@ -29,6 +30,7 @@ class PulidModel(nn.Module):
         super().__init__()
 
         self.model = model
+        self.version = "v1"
         self.image_proj_model = self.init_id_adapter()
         self.image_proj_model.load_state_dict(model["image_proj"])
         self.ip_layers = To_KV(model["ip_adapter"])
@@ -40,6 +42,15 @@ class PulidModel(nn.Module):
     def get_image_embeds(self, face_embed, clip_embeds):
         embeds = self.image_proj_model(face_embed, clip_embeds)
         return embeds
+
+
+class PulidModelV11(PulidModel):
+    def __init__(self, model):
+        super().__init__(model)
+        self.version = "v1.1"
+
+    def init_id_adapter(self):
+        return IDFormer()
 
 class To_KV(nn.Module):
     def __init__(self, state_dict):
@@ -218,10 +229,22 @@ class PulidModelLoader:
                     st_model["ip_adapter"][key.replace("ip_adapter.", "")] = model[key]
             model = st_model
         
-        # Also initialize the model, takes longer to load but then it doesn't have to be done every time you change parameters in the apply node
-        model = PulidModel(model)
+        # Initialize the right image projection module up front so workflow edits
+        # don't repeatedly pay the setup cost.
+        model_version = self._detect_model_version(model["image_proj"])
+        if model_version == "v1.1":
+            model = PulidModelV11(model)
+        else:
+            model = PulidModel(model)
 
         return (model,)
+
+    def _detect_model_version(self, image_proj_state_dict):
+        if any(key.startswith("id_embedding_mapping.") for key in image_proj_state_dict):
+            return "v1.1"
+        if any(key.startswith("body.") for key in image_proj_state_dict):
+            return "v1"
+        raise Exception("Unknown PuLID image projection format")
 
 class PulidInsightFaceLoader:
     @classmethod
@@ -294,6 +317,24 @@ class ApplyPulid:
     FUNCTION = "apply_pulid"
     CATEGORY = "pulid"
 
+    def _build_uncond_inputs(self, id_cond, id_vit_hidden, device, dtype, noise):
+        if noise == 0:
+            id_uncond = torch.zeros_like(id_cond)
+        else:
+            id_uncond = torch.rand_like(id_cond) * noise
+
+        id_vit_hidden_uncond = []
+        for vit_hidden in id_vit_hidden:
+            if noise == 0:
+                id_vit_hidden_uncond.append(torch.zeros_like(vit_hidden))
+            else:
+                id_vit_hidden_uncond.append(torch.rand_like(vit_hidden) * noise)
+
+        return (
+            id_uncond.to(device, dtype=dtype),
+            [vit_hidden.to(device, dtype=dtype) for vit_hidden in id_vit_hidden_uncond],
+        )
+
     def apply_pulid(self, model, pulid, eva_clip, face_analysis, image, weight, start_at, end_at, method=None, noise=0.0, fidelity=None, projection=None, attn_mask=None):
         work_model = model.clone()
         
@@ -344,6 +385,8 @@ class ApplyPulid:
         face_helper.face_parse = init_parsing_model(model_name='bisenet', device=device)
 
         bg_label = [0, 16, 18, 7, 8, 9, 14, 15]
+        id_cond_list = []
+        id_vit_hidden_list = []
         cond = []
         uncond = []
 
@@ -391,20 +434,32 @@ class ApplyPulid:
             id_cond_vit = torch.div(id_cond_vit, torch.norm(id_cond_vit, 2, 1, True))
 
             # combine embeddings
-            id_cond = torch.cat([iface_embeds, id_cond_vit], dim=-1)
-            if noise == 0:
-                id_uncond = torch.zeros_like(id_cond)
+            id_cond = torch.cat([iface_embeds, id_cond_vit], dim=-1).to(device, dtype=dtype)
+            id_vit_hidden = [vit_hidden.to(device, dtype=dtype) for vit_hidden in id_vit_hidden]
+
+            if pulid_model.version == "v1.1":
+                id_cond_list.append(id_cond)
+                id_vit_hidden_list.append(id_vit_hidden)
             else:
-                id_uncond = torch.rand_like(id_cond) * noise
-            id_vit_hidden_uncond = []
-            for idx in range(len(id_vit_hidden)):
-                if noise == 0:
-                    id_vit_hidden_uncond.append(torch.zeros_like(id_vit_hidden[idx]))
-                else:
-                    id_vit_hidden_uncond.append(torch.rand_like(id_vit_hidden[idx]) * noise)
-            
-            cond.append(pulid_model.get_image_embeds(id_cond, id_vit_hidden))
-            uncond.append(pulid_model.get_image_embeds(id_uncond, id_vit_hidden_uncond))
+                id_uncond, id_vit_hidden_uncond = self._build_uncond_inputs(
+                    id_cond, id_vit_hidden, device, dtype, noise
+                )
+                cond.append(pulid_model.get_image_embeds(id_cond, id_vit_hidden))
+                uncond.append(pulid_model.get_image_embeds(id_uncond, id_vit_hidden_uncond))
+
+        if pulid_model.version == "v1.1" and id_cond_list:
+            id_cond = torch.stack(id_cond_list, dim=1)
+            id_vit_hidden = id_vit_hidden_list[0]
+            for image_hidden in id_vit_hidden_list[1:]:
+                for idx, vit_hidden in enumerate(image_hidden):
+                    id_vit_hidden[idx] = torch.cat([id_vit_hidden[idx], vit_hidden], dim=1)
+
+            id_uncond, id_vit_hidden_uncond = self._build_uncond_inputs(
+                id_cond_list[0], id_vit_hidden_list[0], device, dtype, noise
+            )
+
+            cond = [pulid_model.get_image_embeds(id_cond, id_vit_hidden)]
+            uncond = [pulid_model.get_image_embeds(id_uncond, id_vit_hidden_uncond)]
 
         if not cond:
             # No faces detected, return the original model
